@@ -75,50 +75,62 @@ func writeRequest(writer io.Writer, cmd string, args ...string) error {
     return err
 }
 
+var newline = []byte{'\r', '\n'}
 func commandBytes(cmd string, args ...string) []byte {
-    cmdbuf := bytes.NewBufferString(fmt.Sprintf("*%d\r\n$%d\r\n%s\r\n", len(args)+1, len(cmd), cmd))
+    var cmdbuf bytes.Buffer
+
+    cmdbuf.WriteByte('*')
+    cmdbuf.WriteString(strconv.Itoa(len(args)+1))
+    cmdbuf.Write([]byte{'\r', '\n', '$'})
+    cmdbuf.WriteString(strconv.Itoa(len(cmd)))
+    cmdbuf.Write(newline)
+    cmdbuf.WriteString(cmd)
+    cmdbuf.Write(newline)
     for _, s := range args {
-        cmdbuf.WriteString(fmt.Sprintf("$%d\r\n%s\r\n", len(s), s))
+        cmdbuf.WriteByte('$')
+        cmdbuf.WriteString(strconv.Itoa(len(s)))
+        cmdbuf.Write(newline)
+        cmdbuf.WriteString(s)
+        cmdbuf.Write(newline)
     }
     return cmdbuf.Bytes()
 }
 
+var errBytes = []byte{'E', 'R', 'R', ' '};
 func readResponse(reader *bufio.Reader) (interface{}, error) {
-
-    var line string
+    var line []byte
     var err error
 
     //read until the first non-whitespace line
     for {
-        line, err = reader.ReadString('\n')
+        line, err = reader.ReadBytes('\r')
         if len(line) == 0 || err != nil {
             return nil, err
         }
-        line = strings.TrimSpace(line)
         if len(line) > 0 {
             break
         }
+
+        b, err := reader.ReadByte()
+        if b != '\n' || err != nil {
+            return nil, RedisError("Invalid delemeter")
+        }
     }
 
-    if line[0] == '+' {
-        return strings.TrimSpace(line[1:]), nil
-    }
+    prefix, line := line[0], line[1:len(line)-1]
+    switch(prefix) {
+    case '+':
+        return line, nil
 
-    if strings.HasPrefix(line, "-ERR ") {
-        errmesg := strings.TrimSpace(line[5:])
-        return nil, RedisError(errmesg)
-    }
-
-    if line[0] == ':' {
-        n, err := strconv.ParseInt(strings.TrimSpace(line[1:]), 10, 64)
+    case ':':
+        n, err := strconv.ParseInt(string(line), 10, 64)
         if err != nil {
             return nil, RedisError("Int reply is not a number")
         }
         return n, nil
-    }
 
-    if line[0] == '*' {
-        size, err := strconv.Atoi(strings.TrimSpace(line[1:]))
+    case '*':
+        size, err := strconv.Atoi(string(line))
         if err != nil {
             return nil, RedisError("MultiBulk reply expected a number")
         }
@@ -137,8 +149,14 @@ func readResponse(reader *bufio.Reader) (interface{}, error) {
             // dont read end of line as might not have been bulk
         }
         return res, nil
+
+    case '-':
+        if bytes.Compare(line[:4], errBytes) == 0 {
+            return nil, RedisError(string(line[4:]))
+        }
     }
-    return readBulk(reader, line)
+
+    return readBulk(reader, string(line))
 }
 
 func (client *Client) rawSend(c net.Conn, cmd []byte) (interface{}, error) {
@@ -147,7 +165,7 @@ func (client *Client) rawSend(c net.Conn, cmd []byte) (interface{}, error) {
         return nil, err
     }
 
-    reader := bufio.NewReader(c)
+    reader := bufio.NewReaderSize(c, 512)
 
     data, err := readResponse(reader)
     if err != nil {
